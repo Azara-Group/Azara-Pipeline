@@ -1,6 +1,6 @@
 # Azara Pipeline — Documento de Arquitetura
 
-**Status:** v0.1.0-preview em andamento — núcleo (engine de pipeline + Result pattern) implementado.
+**Status:** v0.2.0-preview em andamento — núcleo e camada de comandos implementados.
 **Alvo:** .NET 10 · C# 13 · biblioteca open source, sem dependência de ASP.NET Core.
 
 Este documento registra a arquitetura da **Azara Pipeline** e o racional de cada decisão técnica. É atualizado conforme a biblioteca evolui; mudanças de arquitetura relevantes também geram um ADR em [`docs/adr/`](adr/).
@@ -45,12 +45,12 @@ Princípios que guiam toda decisão abaixo:
 AzaraPipeline.sln
 ├── src/
 │   ├── Azara.Pipeline/                          # núcleo: engine + Result (zero deps) — implementado (v0.1)
-│   ├── Azara.Pipeline.Commands/                 # ICommand/ICommandHandler/IPipelineBehavior — planejado (v0.2)
+│   ├── Azara.Pipeline.Commands/                 # ICommand/ICommandHandler/IPipelineBehavior — implementado (v0.2)
 │   ├── Azara.Pipeline.Logging/                  # integração com Microsoft.Extensions.Logging — planejado (v0.3)
 │   └── Azara.Pipeline.DependencyInjection/       # integração com Microsoft.Extensions.DependencyInjection — planejado (v0.3)
 ├── tests/
 │   ├── Azara.Pipeline.Tests/                    # implementado (v0.1)
-│   ├── Azara.Pipeline.Commands.Tests/
+│   ├── Azara.Pipeline.Commands.Tests/           # implementado (v0.2)
 │   ├── Azara.Pipeline.Logging.Tests/
 │   ├── Azara.Pipeline.DependencyInjection.Tests/
 │   └── Azara.Pipeline.IntegrationTests/
@@ -58,10 +58,13 @@ AzaraPipeline.sln
 │   └── Azara.Pipeline.Benchmarks/               # BenchmarkDotNet — planejado (v0.4)
 ├── samples/
 │   ├── Samples.ConsoleApp.Pipeline/             # implementado (v0.1)
+│   ├── Samples.ConsoleApp.OrderProcessing/      # implementado (v0.2)
 │   ├── Samples.MinimalApi/                      # planejado (v0.4)
 │   └── Samples.WorkerService/                   # planejado (v0.4)
-├── Directory.Build.props                        # metadata comum, nullable, langversion
+├── .github/workflows/publish.yml                # pack + push via NuGet Trusted Publishing
+├── Directory.Build.props                        # metadata comum, nullable, langversion, versão do wave
 ├── Directory.Packages.props                      # central package management
+├── assets/icon.png                              # ícone dos pacotes NuGet
 ├── LICENSE
 └── docs/
     ├── architecture.md                          # este documento
@@ -73,7 +76,7 @@ AzaraPipeline.sln
 | Pacote | Responsabilidade | Depende de | Status |
 |---|---|---|---|
 | `Azara.Pipeline` | Engine genérica de pipeline (`PipelineBuilder`, `IPipelineMiddleware`), `Result`/`Result<T>`/`Error` | BCL apenas | ✅ v0.1 |
-| `Azara.Pipeline.Commands` | Açúcar sintático de comando/handler/behavior sobre a engine core (estilo request/response) | `Azara.Pipeline` | planejado v0.2 |
+| `Azara.Pipeline.Commands` | Açúcar sintático de comando/handler/behavior sobre a engine core (estilo request/response) | `Azara.Pipeline` | ✅ v0.2 |
 | `Azara.Pipeline.Logging` | `LoggingBehavior`, mensagens estruturadas via `LoggerMessage` source generator | `Azara.Pipeline`, `Microsoft.Extensions.Logging.Abstractions` | planejado v0.3 |
 | `Azara.Pipeline.DependencyInjection` | `AddAzaraPipeline(...)`, descoberta de handlers/behaviors por assembly scanning | `Azara.Pipeline.Commands`, `Microsoft.Extensions.DependencyInjection.Abstractions` | planejado v0.3 |
 
@@ -181,14 +184,15 @@ Pontos deliberados:
 
 ## 6. Camada de comandos
 
-> Planejado para v0.2 — ainda não implementado.
-
-Sobre o núcleo, `Azara.Pipeline.Commands` oferecerá a ergonomia de comando/handler:
+Sobre o núcleo, `Azara.Pipeline.Commands` ([`src/Azara.Pipeline.Commands`](../src/Azara.Pipeline.Commands/)) oferece a ergonomia de comando/handler:
 
 ```csharp
-public interface ICommand<TResult>;
+public interface ICommand<TResult> { }
 
-public sealed class CommandContext : IPipelineContext { /* ... */ }
+public sealed class CommandContext : PipelineContext
+{
+    public string CorrelationId { get; }
+}
 
 public interface ICommandHandler<TCommand, TResult>
     where TCommand : ICommand<TResult>
@@ -211,11 +215,28 @@ public interface IPipelineInvoker
 {
     Task<Result<TResult>> SendAsync<TResult>(
         ICommand<TResult> command,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken = default);
+}
+
+public sealed class PipelineInvokerBuilder
+{
+    public PipelineInvokerBuilder AddCommand<TCommand, TResult>(
+        ICommandHandler<TCommand, TResult> handler,
+        params IPipelineBehavior<TCommand, TResult>[] behaviors)
+        where TCommand : ICommand<TResult>;
+
+    public IPipelineInvoker Build();
 }
 ```
 
-`IPipelineBehavior<TCommand, TResult>` é literalmente um `IPipelineMiddleware<TContext>` especializado para o par comando/resultado — a camada de comandos não reinventa a composição, só a tipa. O `IPipelineInvoker` resolverá, para cada `TCommand`, a lista de behaviors aplicáveis (globais + específicos) e o handler, montará a cadeia via `PipelineBuilder<CommandContext>` e **cacheará o delegate compilado por tipo de comando** em um `ConcurrentDictionary<Type, Delegate>`.
+`IPipelineBehavior<TCommand, TResult>` segue o mesmo padrão de composição do `IPipelineMiddleware<TContext>` do núcleo — decide chamar `next()` ou curto-circuitar — mas tipado ao par comando/resultado, porque `PipelineDelegate<TContext>` do núcleo retorna `Result` (não genérico) e não consegue carregar um valor tipado. Por isso a camada de comandos não reaproveita `PipelineBuilder<TContext>` literalmente; ela reimplementa a mesma composição sobre `CommandHandlerDelegate<TResult>`, que pode carregar `TResult`.
+
+Duas decisões aqui refinam o esboço original deste documento, depois de a implementação expor uma opção mais simples:
+
+- **`CommandContext` herda de `PipelineContext`** (a implementação concreta do núcleo) em vez de reimplementar `IPipelineContext` do zero — reuso direto de `Items`/`CancellationToken`/`Services`, só adiciona `CorrelationId`.
+- **Sem `ConcurrentDictionary<Type, Delegate>` cacheado em runtime.** A v0.2 não tem descoberta automática de handlers/behaviors (isso é `Azara.Pipeline.DependencyInjection`, v0.3) — o registro é explícito via `PipelineInvokerBuilder.AddCommand<TCommand, TResult>(...)`, que já conhece `TCommand`/`TResult` em tempo de compilação. Isso permite compilar a cadeia inteira (behaviors + handler) em `Build()`, uma única vez, guardada em um `Dictionary<Type, object>` comum. Em `SendAsync<TResult>`, o despacho é só uma busca no dicionário seguida de um **cast** para `CommandHandlerWrapper<TResult>` — não uma chamada reflexiva — porque o `TResult` do chamador já é garantido pelo compilador (`command : ICommand<TResult>`). Zero reflexão no caminho de execução, e falha rápido: comando sem handler registrado lança na primeira chamada, não silenciosamente. Quando a v0.3 trouxer descoberta via assembly scanning, essa mesma ideia de cache por tipo continua válida — só a origem do registro muda, de chamada explícita para reflexão no startup.
+
+O sample [`samples/Samples.ConsoleApp.OrderProcessing`](../samples/Samples.ConsoleApp.OrderProcessing/Program.cs) demonstra um comando com dois behaviors (trace + validação) e os caminhos de sucesso e curto-circuito.
 
 ## 7. Fluxo de execução
 
@@ -240,7 +261,7 @@ sequenceDiagram
     Inv-->>App: Result<T>
 ```
 
-Este fluxo completo (com `ExceptionHandlingMiddleware` e `LoggingBehavior`) entra em vigor a partir da v0.3. Na v0.1, a engine crua (`PipelineBuilder<TContext>`) já implementa a composição básica: `App → middlewares registrados → terminal`, sem a borda de exceção — ver [`samples/Samples.ConsoleApp.Pipeline`](../samples/Samples.ConsoleApp.Pipeline/Program.cs).
+Este fluxo completo (com `ExceptionHandlingMiddleware` e `LoggingBehavior`) entra em vigor a partir da v0.3. Na v0.2, `App → PipelineInvoker → Behaviors registrados → ICommandHandler` já funciona (ver [`samples/Samples.ConsoleApp.OrderProcessing`](../samples/Samples.ConsoleApp.OrderProcessing/Program.cs)), só faltam as bordas de `ExceptionHandlingMiddleware` e `LoggingBehavior`. Na v0.1, a engine crua (`PipelineBuilder<TContext>`) implementa a composição básica sem tipagem de comando: `App → middlewares registrados → terminal` — ver [`samples/Samples.ConsoleApp.Pipeline`](../samples/Samples.ConsoleApp.Pipeline/Program.cs).
 
 ## 8. Tratamento global de exceções
 
@@ -271,6 +292,8 @@ O `CancellationToken` vive em `IPipelineContext.CancellationToken` como fonte ú
 
 Cancelamento requisitado durante a execução gera `OperationCanceledException`. Até a v0.3 (quando o `ExceptionHandlingMiddleware` existir), essa exceção propaga sem tratamento — o handler final deve observar `context.CancellationToken` explicitamente (`ThrowIfCancellationRequested()`) e o chamador deve tratar `OperationCanceledException`. A partir da v0.3, ela será convertida para `Result.Cancelled()` antes de qualquer `IPipelineExceptionHandler` customizado.
 
+`CommandContext` (v0.2) herda `PipelineContext`, então o mesmo token passado em `IPipelineInvoker.SendAsync(command, cancellationToken)` chega a `context.CancellationToken` dentro de handlers e behaviors — testado em [`PipelineInvokerTests.SendAsync_PropagatesCancellationTokenToContext`](../tests/Azara.Pipeline.Commands.Tests/PipelineInvokerTests.cs).
+
 ## 10. Logging opcional
 
 > Planejado para v0.3 — ainda não implementado.
@@ -299,6 +322,7 @@ Cancelamento requisitado durante a execução gera `OperationCanceledException`.
 - **Unitários por pacote** (`xUnit` + `Shouldly`): cada middleware/behavior testado isoladamente com um `next` fake.
 - **Testes de contrato da engine** (implementados em [`PipelineBuilderTests`](../tests/Azara.Pipeline.Tests/PipelineBuilderTests.cs)): ordem de registro respeitada, curto-circuito sem chamar `next()`, reuso do pipeline compilado entre execuções, exceção em uma execução não corrompe execuções seguintes.
 - **Testes de `Result`/`Result<T>`** (implementados em [`ResultTests`](../tests/Azara.Pipeline.Tests/ResultTests.cs)): estados mutuamente exclusivos, acesso inválido lança `InvalidOperationException`, igualdade estrutural, conversão implícita.
+- **Testes da camada de comandos** (implementados em [`PipelineInvokerTests`](../tests/Azara.Pipeline.Commands.Tests/PipelineInvokerTests.cs)): despacho para o handler correto por tipo de comando, ordem de execução dos behaviors, curto-circuito sem chamar o handler, comando sem handler registrado lança, registro duplicado do mesmo comando lança, propagação do `CancellationToken` para o `CommandContext`.
 - **Testes de integração** (`Azara.Pipeline.IntegrationTests`, planejado v0.3): cenário ponta a ponta com DI real.
 
 ## 14. Estratégia de benchmarks
@@ -311,7 +335,9 @@ Projeto `Azara.Pipeline.Benchmarks` com **BenchmarkDotNet** e `[MemoryDiagnoser]
 
 - **Licença:** MIT — `PackageLicenseExpression=MIT` via `Directory.Build.props`. Arquivo [`LICENSE`](../LICENSE) na raiz.
 - **Central Package Management** via [`Directory.Packages.props`](../Directory.Packages.props).
-- **Ícone e publicação real no NuGet.org:** adiados para a v0.9 (congelamento de API), junto com SourceLink, symbol packages e validação de trimming/AOT — ver roadmap.
+- **Ícone:** [`assets/icon.png`](../assets/icon.png), referenciado centralmente em `Directory.Build.props` (`PackageIcon`) e incluído por pacote via `<None Include=".../assets/icon.png" Pack="true" />`.
+- **Versionamento em lockstep:** todos os pacotes compartilham a mesma `<Version>` em `Directory.Build.props`, alinhada à "onda" de release do roadmap (`0.1.0-preview`, `0.2.0-preview`, ...), mesmo quando um pacote específico não mudou naquela onda. Simplifica o início do projeto; pode virar versionamento independente por pacote se o histórico justificar.
+- **Publicação:** ao contrário do plano original (adiar para v0.9), a publicação real começou já na v0.1 para validar o pipeline de release cedo. `.github/workflows/publish.yml` builda, testa, empacota e publica no NuGet.org via **Trusted Publishing** (token OIDC de curta duração, sem API key armazenada), disparado por tag `v*` ou manualmente. `Azara.Pipeline` já está publicado como [`0.1.0-preview`](https://www.nuget.org/packages/Azara.Pipeline). SourceLink, symbol packages e validação de trimming/AOT continuam para a v0.9 (congelamento de API).
 - **Nomes de pacote:** `Azara.Pipeline`, `Azara.Pipeline.Commands`, `Azara.Pipeline.Logging`, `Azara.Pipeline.DependencyInjection`.
 
 ## 16. Roadmap de versões
@@ -319,7 +345,7 @@ Projeto `Azara.Pipeline.Benchmarks` com **BenchmarkDotNet** e `[MemoryDiagnoser]
 | Versão | Escopo | Critério de saída | Status |
 |---|---|---|---|
 | **v0.1.0-preview** | Núcleo: `PipelineBuilder`, `IPipelineMiddleware`, `IPipelineContext`, `Result`/`Result<T>`/`Error` | Sample de console rodando um pipeline simples; testes unitários do core passando | ✅ concluído |
-| **v0.2.0-preview** | Camada de comandos: `ICommand`, `ICommandHandler`, `IPipelineBehavior`, `PipelineInvoker` com cache de cadeia | Sample de processamento de pedidos com 2+ behaviors | próximo |
+| **v0.2.0-preview** | Camada de comandos: `ICommand`, `ICommandHandler`, `IPipelineBehavior`, `PipelineInvoker` com cadeia compilada no registro | Sample de processamento de pedidos com 2+ behaviors | ✅ concluído |
 | **v0.3.0-preview** | `Azara.Pipeline.Logging` (LoggerMessage) + `Azara.Pipeline.DependencyInjection` (assembly scanning) + `ExceptionHandlingMiddleware` | Sample com DI completo + logging estruturado visível | planejado |
 | **v0.4.0-preview** | Benchmarks publicados, hardening de performance, samples de Minimal API e Worker Service | Benchmark de overhead documentado; zero alocação no caminho feliz confirmada | planejado |
 | **v0.9.0-rc** | Congelamento de API, XML docs completos, validação AOT/trimming, SourceLink, symbol packages, ícone, publicação NuGet.org | Revisão de breaking changes concluída; checklist de release fechado | planejado |
@@ -329,6 +355,10 @@ Projeto `Azara.Pipeline.Benchmarks` com **BenchmarkDotNet** e `[MemoryDiagnoser]
 
 ## 17. Estado atual
 
-A v0.1.0-preview está implementada: os quatro tipos do núcleo, `Result`/`Result<T>`/`Error`, 17 testes unitários e um sample de console cobrindo sucesso, curto-circuito e cancelamento. Nenhuma decisão de arquitetura foi violada durante a implementação.
+A v0.1.0-preview está implementada e publicada no NuGet.org: os quatro tipos do núcleo, `Result`/`Result<T>`/`Error`, 17 testes unitários e um sample de console cobrindo sucesso, curto-circuito e cancelamento.
 
-Próximo passo: v0.2.0-preview (`Azara.Pipeline.Commands`) — a ser escopada separadamente quando este trabalho for retomado.
+A v0.2.0-preview está implementada: `ICommand`, `CommandContext`, `ICommandHandler`, `IPipelineBehavior`, `IPipelineInvoker`, `PipelineInvokerBuilder`/`PipelineInvoker` com dispatch sem reflexão, 7 testes unitários e o sample de processamento de pedidos com dois behaviors. Duas decisões refinaram o esboço original (`CommandContext` herda `PipelineContext`; cadeia compilada no registro em vez de cache em runtime) — justificadas na seção 6.
+
+Nenhuma decisão de arquitetura foi violada durante a implementação de nenhuma das duas versões.
+
+Próximo passo: v0.3.0-preview (`Azara.Pipeline.Logging`, `Azara.Pipeline.DependencyInjection`, `ExceptionHandlingMiddleware`) — a ser escopada separadamente quando este trabalho for retomado.
