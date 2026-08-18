@@ -1,0 +1,28 @@
+## .NET
+bin/
+obj/
+out/
+*.user
+*.suo
+
+## Test / coverage
+[Tt]est[Rr]esult*/
+*.trx
+coverage*.xml
+coverage*.json
+coverage*.info
+
+## Rider / VS / VS Code
+.vs/
+.vscode/
+.idea/
+*.DotSettings.user
+
+## OS
+.DS_Store
+Thumbs.db
+
+## NuGet
+*.nupkg
+*.snupkg
+.nuget/

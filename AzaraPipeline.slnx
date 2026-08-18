@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/Samples.ConsoleApp.Pipeline/Samples.ConsoleApp.Pipeline.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Azara.Pipeline/Azara.Pipeline.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Azara.Pipeline.Tests/Azara.Pipeline.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Motor de pipeline genérico inspirado em middleware do ASP.NET Core, com Result pattern e zero dependências externas.</Description>
+    <PackageTags>pipeline;middleware;result-pattern</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Equals/GetHashCode/operadores são autoexplicativos; docs focam na API que o usuário realmente lê. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+</Project>
